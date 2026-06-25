@@ -1,0 +1,81 @@
+FROM verlai/verl:vllm012.latest
+
+SHELL ["/bin/bash", "-lc"]
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Start from the official VERL runtime image, but remove preinstalled task-specific
+# packages and source/cache remnants before copying the benchmark workspace.
+RUN set -euxo pipefail; \
+    python -m pip uninstall -y vllm || true; \
+    python - <<'PY'
+import pathlib
+import shutil
+import site
+
+roots = []
+try:
+    roots.extend(site.getsitepackages())
+except Exception:
+    pass
+try:
+    user_site = site.getusersitepackages()
+    if user_site:
+        roots.append(user_site)
+except Exception:
+    pass
+
+for root in roots:
+    path = pathlib.Path(root)
+    if not path.exists():
+        continue
+    for child in path.iterdir():
+        name = child.name.lower()
+        if "vllm" in name or name.startswith("verl") or name.startswith("verl-"):
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                try:
+                    child.unlink()
+                except FileNotFoundError:
+                    pass
+PY
+
+RUN set -euxo pipefail; \
+    rm -rf /workspace /root/.cache/pip /root/.cache/huggingface /tmp/* /var/tmp/*; \
+    find /root /opt /usr/local -depth \( -iname '*vllm*' -o -iname '*verl*' \) -exec rm -rf {} + 2>/dev/null || true; \
+    find /root /opt /usr/local -type d -name .git -prune -exec rm -rf {} + 2>/dev/null || true; \
+    find /root /opt /usr/local -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+
+WORKDIR /workspace
+
+COPY task/PROMPT.md /workspace/PROMPT.md
+COPY task/verl /workspace/verl
+COPY task/vllm-src /workspace/vllm-src
+
+RUN set -euxo pipefail; \
+    find /workspace -type d -name .git -prune -exec rm -rf {} +; \
+    find /workspace -type d -name __pycache__ -prune -exec rm -rf {} +; \
+    ! grep -RIn --exclude-dir=__pycache__ -i vllm /workspace/verl; \
+    ! find /workspace/verl -iname '*vllm*' | grep .; \
+    ! grep -RIn --exclude-dir=__pycache__ -i -E '\bverl\b|verl-project|volcengine/verl|actor_rollout_ref|rollout_ref|verl_' /workspace/vllm-src; \
+    ! find /workspace -type d -name .git | grep .
+
+RUN set -euxo pipefail; \
+    cd /tmp; \
+    python - <<'PY'
+import importlib.util
+import sys
+
+spec = importlib.util.find_spec("vllm")
+if spec is not None:
+    raise SystemExit(f"unexpected installed vllm package: {spec.origin}")
+
+print("sanitized Python environment: no installed vllm package")
+print("python", sys.version)
+PY
+
+WORKDIR /workspace/verl
+
+CMD ["/bin/bash"]

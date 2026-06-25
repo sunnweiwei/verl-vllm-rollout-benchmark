@@ -1,0 +1,7 @@
+*
+!docker/
+!docker/Dockerfile.eval
+!task/
+!task/PROMPT.md
+!task/verl/**
+!task/vllm-src/**
