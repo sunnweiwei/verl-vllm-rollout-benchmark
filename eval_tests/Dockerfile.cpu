@@ -1,0 +1,5 @@
+FROM verlai/verl:vllm012.latest
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN python -m pip install --no-cache-dir pytest pytest-asyncio
