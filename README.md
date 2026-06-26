@@ -28,3 +28,17 @@ Inside the container:
 - vLLM source: `/workspace/vllm-src`
 
 The image removes preinstalled vLLM package remnants from the base runtime and does not include git history for the task sources.
+
+## Gemini Candidate Runner
+
+`scripts/run_gemini_candidate.py` runs one Gemini CLI candidate in the task Docker, exports a patch, applies it to a fresh task checkout, and runs the CPU eval tests in the separate test Docker.
+
+It expects a patched Gemini CLI runtime at `/mnt/data/projects/deep-swe/third_party/gemini_cli_runtime` and reads secrets only from runtime environment variables:
+
+```bash
+GEMINI_API_KEYS="key1,key2" scripts/run_gemini_candidate.py \
+  --model gemini-3.1-pro-preview \
+  --run-name gemini31pro-preview-candidate
+```
+
+Run artifacts are written outside this repository under `/mnt/data/projects/verl-vllm-gemini-runs/`.
