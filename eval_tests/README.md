@@ -14,19 +14,28 @@ The runner copies the checkout into a temporary workspace, overlays the tests
 under `tests/eval_vllm/`, and runs pytest inside a dedicated test image by
 default. This test image is separate from the agent workspace image.
 
-The tests focus on public behavior:
+The tests focus on public behavior across 46 CPU pytest cases:
 
-- `rollout.name=vllm` can be initialized through the normal `LLMServerManager`.
-- VERL's rollout client can generate through that backend and returns
-  `TokenOutput` data without leaking in-flight load-balancer state.
-- Fully async generation resumes after an aborted partial rollout.
-- The rollout replica lifecycle methods used by checkpoint/update phases are
-  forwarded to rollout servers.
-- Existing rollout configuration still exposes backend-specific engine kwargs.
+- backend/config selection for `rollout.name=vllm`, including reward-model
+  rollout and unsupported PD-disaggregation handling.
+- token generation contracts: sampling limits, logprobs, prompt logprobs,
+  abort output, global step metadata, multimodal payloads, LoRA adapter use,
+  routed experts, and MTP rollout stats.
+- agent-loop/DataProto contracts: response masks, rollout logprobs,
+  extra-field schema stability, routed-expert alignment, and multimodal
+  forwarding.
+- fully async partial-rollout behavior: abort resume, max-token budget
+  updates, global-step min/max tracking, routed-expert merging, and multimodal
+  forwarding across resumed calls.
+- checkpoint/lifecycle behavior: abort/release/update/resume ordering,
+  replica lifecycle fan-out, global step propagation, and profiling hooks.
+- LoRA/adapter weight sync behavior for naive and non-naive checkpoint paths.
+- downstream training consumers of rollout outputs, including rollout
+  correction/bypass mode and router replay.
 
 The CPU tests replace the actual vLLM engine launch with scripted Ray rollout
 servers, so they do not require GPUs or model weights. They intentionally avoid
 checking module paths or concrete implementation class names; the fixed
 contract is that VERL can select the backend with `rollout.name=vllm` and then
-use the same manager/client/lifecycle entry points as other async rollout
-backends.
+use compatible manager/client/lifecycle and training-output behavior as other
+async rollout backends.
