@@ -1,4 +1,9 @@
 import copy
+import asyncio
+import importlib
+import inspect
+from pathlib import Path
+import pkgutil
 import sys
 import types
 from types import SimpleNamespace
@@ -209,16 +214,39 @@ class FakeTokenLogprob:
 class FakeAsyncEngine:
     def __init__(self, final_outputs: list[Any], *, loras: set[int] | None = None):
         self.final_outputs = list(final_outputs)
-        self.loras = set(loras or set())
+        self.loras = loras if loras is not None else set()
         self.generate_calls = []
         self.lifecycle_calls = []
-        self.output_processor = SimpleNamespace(request_states={})
+        self.aborted_request_ids = []
+        self.output_processor = SimpleNamespace(
+            request_states={},
+            abort_requests=lambda request_ids: self.aborted_request_ids.extend(list(request_ids)),
+        )
+        self.engine_core = SimpleNamespace(abort_requests_async=self._abort_requests_async)
+
+    async def _abort_requests_async(self, request_ids):
+        self.lifecycle_calls.append(("engine_core_abort_requests", {"request_ids": list(request_ids)}))
+
+    async def collective_rpc(self, *args, **kwargs):
+        payload = dict(kwargs)
+        if args:
+            payload.setdefault("method", args[0])
+            if len(args) > 1:
+                payload.setdefault("positional_args", args[1:])
+        self.lifecycle_calls.append(("collective_rpc", payload))
 
     async def list_loras(self):
-        return set(self.loras)
+        return self.loras
 
-    def generate(self, **kwargs):
-        self.generate_calls.append(kwargs)
+    def generate(self, *args, **kwargs):
+        call = {"args": args, **kwargs}
+        if args:
+            call.setdefault("prompt", args[0])
+        if len(args) > 1:
+            call.setdefault("sampling_params", args[1])
+        if len(args) > 2:
+            call.setdefault("request_id", args[2])
+        self.generate_calls.append(call)
         final_output = self.final_outputs.pop(0)
 
         async def gen():
@@ -243,6 +271,21 @@ class FakeAsyncEngine:
 
     async def resume_generation(self):
         self.lifecycle_calls.append(("resume_generation", {}))
+
+    async def abort(self, request_id: str):
+        self.lifecycle_calls.append(("abort", {"request_id": request_id}))
+
+    async def abort_request(self, request_id: str):
+        self.lifecycle_calls.append(("abort_request", {"request_id": request_id}))
+
+    async def start_profile(self, **kwargs):
+        self.lifecycle_calls.append(("start_profile", kwargs))
+
+    async def stop_profile(self):
+        self.lifecycle_calls.append(("stop_profile", {}))
+
+    def has_unfinished_requests(self):
+        return bool(self.output_processor.request_states)
 
 
 def make_completion_output(
@@ -278,6 +321,87 @@ def make_request_output(
     return SimpleNamespace(outputs=outputs, prompt_logprobs=prompt_logprobs or [None], metrics=metrics)
 
 
+class AnyLoadedLoraSet:
+    """Set-like object that reports any queried LoRA id as loaded."""
+
+    def __contains__(self, _item):
+        return True
+
+    def __iter__(self):
+        return iter([123])
+
+
+def _candidate_generation_classes():
+    from verl.workers.rollout.replica import get_rollout_replica_class
+
+    replica_cls = get_rollout_replica_class("vllm")
+    replica_module_name = replica_cls.__module__
+    module_names = {replica_module_name}
+
+    package_names = set()
+    if "." in replica_module_name:
+        package_names.add(replica_module_name.rsplit(".", 1)[0])
+
+    for package_name in sorted(package_names):
+        try:
+            package = importlib.import_module(package_name)
+        except Exception:
+            continue
+        package_paths = getattr(package, "__path__", None)
+        if package_paths is None:
+            continue
+        for module_info in pkgutil.iter_modules(package_paths, package.__name__ + "."):
+            module_names.add(module_info.name)
+        for package_path in package_paths:
+            root = Path(package_path)
+            for file_path in root.rglob("*.py"):
+                if file_path.name == "__init__.py":
+                    continue
+                relative = file_path.relative_to(root).with_suffix("")
+                module_names.add(package.__name__ + "." + ".".join(relative.parts))
+
+    candidates = []
+    import_errors = []
+    for module_name in sorted(module_names):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # pragma: no cover - reported if discovery fails.
+            import_errors.append((module_name, repr(exc)))
+            continue
+        for name, obj in inspect.getmembers(module):
+            cls = obj
+            ray_metadata = getattr(obj, "__ray_metadata__", None)
+            if ray_metadata is not None and getattr(ray_metadata, "modified_class", None) is not None:
+                cls = ray_metadata.modified_class
+            elif not inspect.isclass(obj):
+                continue
+            if getattr(cls, "__module__", None) != module.__name__:
+                continue
+            generate = getattr(cls, "generate", None)
+            if generate is None:
+                continue
+            score = 0
+            lower = name.lower()
+            module_lower = module.__name__.lower()
+            if "server" in lower:
+                score += 3
+            if "http" in lower:
+                score += 1
+            if "server" in module_lower or "async" in module_lower:
+                score += 1
+            candidates.append((score, module.__name__, name, module, cls))
+
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    if not candidates:
+        details = ", ".join(f"{name}: {err}" for name, err in import_errors) or "no import errors"
+        raise AssertionError(
+            "Could not find a vLLM rollout object with a generate method. "
+            "The backend may use any module or class name, but it must expose "
+            f"a server-like generation object. Import details: {details}"
+        )
+    return candidates
+
+
 def make_vllm_http_server(
     monkeypatch,
     final_outputs: list[Any],
@@ -292,18 +416,19 @@ def make_vllm_http_server(
     loaded_loras: set[int] | None = None,
 ):
     from verl.workers.rollout.replica import RolloutMode
-    from verl.workers.rollout.vllm_rollout import vllm_async_server as module
 
-    monkeypatch.setattr(module, "qwen2_5_vl_dedup_image_tokens", lambda ids, processor: ids)
-    server = module.vLLMHttpServer.__new__(module.vLLMHttpServer)
+    _score, _module_name, _class_name, _module, server_cls = _candidate_generation_classes()[0]
+    server = server_cls.__new__(server_cls)
     server.config = OmegaConf.create(
         {
             "max_model_len": max_model_len,
             "response_length": response_length,
             "prompt_length": prompt_length,
+            "max_num_seqs": 8,
             "repetition_penalty": 1.05,
             "enable_rollout_routing_replay": enable_routing_replay,
             "free_cache_engine": True,
+            "logprobs_mode": "raw_logprobs",
             "mtp": mtp,
         }
     )
@@ -316,8 +441,20 @@ def make_vllm_http_server(
     )
     server.global_steps = None
     server.node_rank = 0
+    server.replica_rank = 0
+    server.active_requests = set()
+    server.active_request_ids = set()
+    server._generation_allowed = asyncio.Event()
+    server._generation_allowed.set()
+    server.workers = []
+    server._server_address = "127.0.0.1"
+    server._server_port = 0
     server.rollout_mode = RolloutMode.HYBRID
-    server.engine = FakeAsyncEngine(final_outputs, loras=loaded_loras)
+    fake_engine = FakeAsyncEngine(final_outputs, loras=loaded_loras)
+    server.engine = fake_engine
+    server.llm = fake_engine
+    server.llm_engine = fake_engine
+    server.async_engine = fake_engine
     return server, server.engine
 
 

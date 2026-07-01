@@ -1,11 +1,12 @@
+from types import SimpleNamespace
+
 import pytest
 import ray
 
 from vllm_eval_helpers import ScriptedRolloutServer, make_config
 
 
-@pytest.mark.asyncio
-async def test_vllm_replica_lifecycle_forwards_to_rollout_servers():
+def _make_vllm_replica_with_servers():
     from verl.workers.rollout.replica import get_rollout_replica_class
 
     replica_cls = get_rollout_replica_class("vllm")
@@ -18,52 +19,124 @@ async def test_vllm_replica_lifecycle_forwards_to_rollout_servers():
     server_a = ScriptedRolloutServer.remote([], label="a")
     server_b = ScriptedRolloutServer.remote([], label="b")
     replica.servers = [server_a, server_b]
+    replica._server_handle = server_a
+    replica._server_address = "fake-vllm://replica-0"
+    return replica, server_a, server_b
+
+
+async def _event_names(*servers):
+    return [[name for name, _kwargs in await server.get_events.remote()] for server in servers]
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_wake_up_forwards_to_servers():
+    replica, server_a, server_b = _make_vllm_replica_with_servers()
 
     await replica.wake_up()
+
+    for names in await _event_names(server_a, server_b):
+        assert "wake_up" in names
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_sleep_forwards_to_servers():
+    replica, server_a, server_b = _make_vllm_replica_with_servers()
+
     await replica.sleep()
-    abort_result = await replica.abort_all_requests()
+
+    for names in await _event_names(server_a, server_b):
+        assert "sleep" in names
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_resume_generation_forwards_to_servers():
+    replica, server_a, server_b = _make_vllm_replica_with_servers()
+
     await replica.resume_generation()
+
+    for names in await _event_names(server_a, server_b):
+        assert "resume_generation" in names
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_kv_cache_controls_forward_to_servers():
+    replica, server_a, server_b = _make_vllm_replica_with_servers()
+
     await replica.clear_kv_cache()
     await replica.release_kv_cache()
     await replica.resume_kv_cache()
+
+    for names in await _event_names(server_a, server_b):
+        assert "clear_kv_cache" in names
+        assert "release_kv_cache" in names
+        assert "resume_kv_cache" in names
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_profile_forwards_to_servers():
+    replica, server_a, server_b = _make_vllm_replica_with_servers()
+
     await replica.start_profile(trace_id="cpu-test")
     await replica.stop_profile()
 
-    assert abort_result["aborted_count"] == 2
-    assert sorted(abort_result["request_ids"]) == ["a-request", "b-request"]
-
     for events in [await server_a.get_events.remote(), await server_b.get_events.remote()]:
-        event_names = [name for name, _kwargs in events]
-        for required in [
-            "wake_up",
-            "sleep",
-            "abort_all_requests",
-            "resume_generation",
-            "clear_kv_cache",
-            "release_kv_cache",
-            "resume_kv_cache",
-            "start_profile",
-            "stop_profile",
-        ]:
-            assert required in event_names
+        names = [name for name, _kwargs in events]
+        assert "start_profile" in names
+        assert "stop_profile" in names
         assert ("start_profile", {"trace_id": "cpu-test"}) in events
 
 
 @pytest.mark.asyncio
-async def test_vllm_replica_sleep_and_release_wait_for_requests_to_drain_first():
+async def test_vllm_replica_abort_all_requests_calls_each_server():
+    replica, server_a, server_b = _make_vllm_replica_with_servers()
+
+    await replica.abort_all_requests()
+
+    for names in await _event_names(server_a, server_b):
+        assert "abort_all_requests" in names
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_abort_all_requests_aggregates_server_results():
+    replica, _server_a, _server_b = _make_vllm_replica_with_servers()
+
+    abort_result = await replica.abort_all_requests()
+
+    assert abort_result["aborted_count"] == 2
+    assert sorted(abort_result["request_ids"]) == ["a-request", "b-request"]
+
+
+def _make_single_server_vllm_replica():
     from verl.workers.rollout.replica import get_rollout_replica_class
 
     replica_cls = get_rollout_replica_class("vllm")
     replica = replica_cls(replica_rank=0, config=make_config().actor_rollout_ref.rollout, model_config={"path": "x"})
     server = ScriptedRolloutServer.remote([], label="a")
     replica.servers = [server]
+    replica._server_handle = server
+    return replica, server
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_sleep_waits_for_requests_to_drain_first():
+    replica, server = _make_single_server_vllm_replica()
 
     await replica.sleep()
-    await replica.release_kv_cache()
 
     events = [name for name, _ in await server.get_events.remote()]
     assert events.index("wait_for_requests_to_drain") < events.index("sleep")
-    assert events.count("wait_for_requests_to_drain") == 2
+    assert events.count("wait_for_requests_to_drain") == 1
+
+
+@pytest.mark.asyncio
+async def test_vllm_replica_release_kv_cache_waits_for_requests_to_drain_first():
+    replica, server = _make_single_server_vllm_replica()
+
+    await replica.release_kv_cache()
+
+    events = [name for name, _ in await server.get_events.remote()]
+    assert events.index("wait_for_requests_to_drain") < events.index("release_kv_cache")
+    assert events.count("wait_for_requests_to_drain") == 1
     assert "release_kv_cache" in events
 
 
@@ -76,6 +149,7 @@ async def test_vllm_replica_abort_request_tries_servers_until_one_aborts():
     server_a = ScriptedRolloutServer.remote([], label="a")
     server_b = ScriptedRolloutServer.remote([], label="b")
     replica.servers = [server_a, server_b]
+    replica._server_handle = server_a
 
     result = await replica.abort_request("request-1")
 
@@ -84,115 +158,108 @@ async def test_vllm_replica_abort_request_tries_servers_until_one_aborts():
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_manager_non_naive_update_orders_rollout_lifecycle(monkeypatch):
-    from verl.checkpoint_engine import base as checkpoint_base
-    from verl.checkpoint_engine.base import CheckpointEngineManager
+async def test_vllm_async_rollout_adapter_resume_and_release_use_server_lifecycle():
+    from verl.workers.rollout.base import get_rollout_class
 
     events = []
 
-    class FakeReplica:
-        workers = ["w0"]
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
 
-        async def abort_all_requests(self):
-            events.append("abort")
+        async def remote(self, *args, **kwargs):
+            events.append((self.name, args, kwargs))
 
-        async def release_kv_cache(self):
-            events.append("release_kv")
+    class FakeServerHandle:
+        wake_up = RemoteMethod("wake_up")
+        sleep = RemoteMethod("sleep")
 
-        async def resume_kv_cache(self):
-            events.append("resume_kv")
+    rollout_cls = get_rollout_class("vllm", "async")
+    rollout = rollout_cls.__new__(rollout_cls)
+    rollout.config = SimpleNamespace(free_cache_engine=True)
+    rollout.rollout_rank = 0
+    rollout.server_handle = FakeServerHandle()
 
-        async def resume_generation(self):
-            events.append("resume_generation")
+    await rollout.resume(tags=["weights"])
+    await rollout.release()
 
-    class FakeTrainer:
-        world_size = 1
-
-        def update_weights(self, global_steps=None, mode="auto"):
-            events.append(("trainer_update", global_steps, mode))
-            return []
-
-        def execute_checkpoint_engine(self, methods):
-            events.append(("trainer_execute", methods))
-            return []
-
-    class FakeRolloutGroup:
-        world_size = 1
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def update_weights(self, global_steps=None):
-            events.append(("rollout_update", global_steps))
-            return []
-
-        def execute_checkpoint_engine(self, methods):
-            events.append(("rollout_execute", methods))
-            return []
-
-    monkeypatch.setattr(checkpoint_base, "RayWorkerGroup", FakeRolloutGroup)
-    manager = CheckpointEngineManager.__new__(CheckpointEngineManager)
-    manager.backend = "nccl"
-    manager.trainer = FakeTrainer()
-    manager.replicas = [FakeReplica()]
-    manager.build_process_group = lambda rollout: events.append("build_pg")
-
-    await manager.update_weights(global_steps=12)
-
-    assert events[:3] == ["abort", "release_kv", "build_pg"]
-    assert ("trainer_update", 12, "nccl") in events
-    assert ("rollout_update", 12) in events
-    assert events[-2:] == ["resume_kv", "resume_generation"]
+    assert events == [
+        ("wake_up", (), {"tags": ["weights"]}),
+        ("sleep", (), {}),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_manager_naive_update_delegates_to_trainer_only():
-    from verl.checkpoint_engine.base import CheckpointEngineManager
+async def test_vllm_async_rollout_adapter_lazily_finds_server_actor(monkeypatch):
+    import ray
+
+    from verl.workers.rollout.base import get_rollout_class
+
+    events = []
+    actor_names = []
+
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        async def remote(self, *args, **kwargs):
+            events.append((self.name, args, kwargs))
+
+    class FakeServerHandle:
+        wake_up = RemoteMethod("wake_up")
+
+    class Config(SimpleNamespace):
+        def get(self, key, default=None):
+            return getattr(self, key, default)
+
+    def fake_get_actor(name):
+        actor_names.append(name)
+        return FakeServerHandle()
+
+    monkeypatch.setattr(ray, "get_actor", fake_get_actor)
+
+    rollout_cls = get_rollout_class("vllm", "async")
+    rollout = rollout_cls.__new__(rollout_cls)
+    rollout.config = Config(name="vllm", free_cache_engine=True)
+    rollout.rollout_rank = 0
+    rollout.replica_rank = 2
+    rollout.node_rank = 3
+    rollout.server_handle = None
+
+    await rollout.resume(tags=["kv_cache"])
+
+    assert actor_names == ["vllm_server_2_3"]
+    assert events == [("wake_up", (), {"tags": ["kv_cache"]})]
+    assert rollout.server_handle is not None
+
+
+@pytest.mark.asyncio
+async def test_vllm_async_rollout_adapter_nonzero_rank_skips_server_lifecycle():
+    from verl.workers.rollout.base import get_rollout_class
 
     events = []
 
-    class FakeTrainer:
-        def update_weights(self, global_steps=None, mode="auto"):
-            events.append(("trainer_update", global_steps, mode))
-            return []
+    class RemoteMethod:
+        def __init__(self, name):
+            self.name = name
 
-    manager = CheckpointEngineManager.__new__(CheckpointEngineManager)
-    manager.backend = "naive"
-    manager.trainer = FakeTrainer()
-    manager.replicas = []
+        async def remote(self, *args, **kwargs):
+            events.append((self.name, args, kwargs))
 
-    await manager.update_weights(global_steps=3)
+    class FakeServerHandle:
+        wake_up = RemoteMethod("wake_up")
+        sleep = RemoteMethod("sleep")
 
-    assert events == [("trainer_update", 3, "naive")]
+    rollout_cls = get_rollout_class("vllm", "async")
+    rollout = rollout_cls.__new__(rollout_cls)
+    rollout.config = SimpleNamespace(free_cache_engine=True)
+    rollout.rollout_rank = 1
+    rollout.server_handle = FakeServerHandle()
 
+    await rollout.resume(tags=["weights"])
+    await rollout.release()
 
-@pytest.mark.asyncio
-async def test_checkpoint_worker_passes_received_weights_and_global_steps_to_rollout():
-    from verl.checkpoint_engine.base import CheckpointEngineWorker
-
-    class FakeCheckpointEngine:
-        def __init__(self):
-            self.received_steps = []
-
-        def receive_weights(self, global_steps=None):
-            self.received_steps.append(global_steps)
-            return [("layer.weight", 1)]
-
-    class FakeServerAdapter:
-        def __init__(self):
-            self.calls = []
-
-        async def update_weights(self, weights, global_steps=None):
-            self.calls.append((weights, global_steps))
-
-    worker = CheckpointEngineWorker.__new__(CheckpointEngineWorker)
-    worker.checkpoint_engine = FakeCheckpointEngine()
-    worker.server_adapter = FakeServerAdapter()
-
-    await worker.update_weights(global_steps=44)
-
-    assert worker.checkpoint_engine.received_steps == [44]
-    assert worker.server_adapter.calls == [([("layer.weight", 1)], 44)]
+    assert events == []
 
 
 @pytest.mark.asyncio

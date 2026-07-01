@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TASK_ROOT = REPO_ROOT / "task"
 DEFAULT_RUNS_ROOT = Path("/mnt/data/projects/verl-vllm-gemini-runs")
 DEFAULT_RUNTIME = Path("/mnt/data/projects/deep-swe/third_party/gemini_cli_runtime")
+DEFAULT_KEY_FILE = Path("/mnt/data/projects/verl-vllm-secrets/gemini_api_keys.txt")
 DEFAULT_TASK_IMAGE_CANDIDATES = (
     "verl-vllm-rollout-benchmark:task-v0",
     "verl-vllm-capability-benchmark:task-v0",
@@ -94,12 +95,15 @@ def slugify(value: str) -> str:
     return value or "gemini"
 
 
-def selected_api_key(env: dict[str, str], key_index: int) -> str | None:
+def selected_api_key(env: dict[str, str], key_index: int, key_file: Path | None) -> str | None:
     if env.get("GEMINI_API_KEY"):
         return env["GEMINI_API_KEY"]
     keys = [k.strip() for k in env.get("GEMINI_API_KEYS", "").split(",") if k.strip()]
     if not keys:
-        return env.get("GOOGLE_API_KEY")
+        if key_file and key_file.exists():
+            keys = [line.strip() for line in key_file.read_text().splitlines() if line.strip()]
+        if not keys:
+            return env.get("GOOGLE_API_KEY")
     return keys[key_index % len(keys)]
 
 
@@ -185,6 +189,7 @@ def run_gemini(
     shell_timeout_sec: int,
     timeout_sec: int | None,
     key_index: int,
+    key_file: Path | None,
 ) -> None:
     node = runtime / "bin" / "node"
     gemini_js = runtime / "bundle" / "gemini.js"
@@ -196,7 +201,7 @@ def run_gemini(
     write_agent_prompt(workspace)
 
     env = os.environ.copy()
-    key = selected_api_key(env, key_index)
+    key = selected_api_key(env, key_index, key_file)
     if not key:
         raise SystemExit("set GEMINI_API_KEY or GEMINI_API_KEYS before running Gemini")
     env["GEMINI_API_KEY"] = key
@@ -334,13 +339,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-image", default=DEFAULT_TEST_IMAGE)
     parser.add_argument("--model", default=os.environ.get("GEMINI_CLI_MODEL", "gemini-3.5-flash"))
     parser.add_argument("--key-index", type=int, default=0)
+    parser.add_argument("--key-file", type=Path, default=DEFAULT_KEY_FILE)
     parser.add_argument("--max-session-turns", type=int, default=200)
     parser.add_argument("--shell-timeout-sec", type=int, default=180)
     parser.add_argument(
         "--timeout-sec",
         type=int,
-        default=7200,
-        help="Gemini timeout in seconds; use 0 for no timeout",
+        default=0,
+        help="Gemini timeout in seconds; 0 disables timeout and lets the patched CLI retry transient API failures indefinitely",
     )
     parser.add_argument(
         "--test-timeout-sec",
@@ -381,6 +387,7 @@ def main() -> int:
         shell_timeout_sec=args.shell_timeout_sec,
         timeout_sec=timeout,
         key_index=args.key_index,
+        key_file=args.key_file,
     )
 
     patch_path = run_dir / "candidate.patch"

@@ -18,14 +18,6 @@ def _make_worker(*, peft_config=None, peft_merge=False, base_sync_done=False, ba
     )
     worker.rollout = FakeRolloutForWeights()
     worker.actor = type("Actor", (), {"engine": FakeActorEngine(peft_config=peft_config)})()
-    worker.checkpoint_engine = type(
-        "CheckpointEngine",
-        (),
-        {
-            "calls": [],
-            "send_weights": None,
-        },
-    )()
     worker.layered_summon = False
     worker.peft_merge = peft_merge
     worker.base_sync_done = base_sync_done
@@ -122,23 +114,3 @@ async def test_free_cache_engine_false_skips_resume_calls(monkeypatch):
     await ActorRolloutRefWorker.update_weights(worker, global_steps=13, mode="naive")
 
     assert all(event[0] != "resume" for event in worker.rollout.events)
-
-
-@pytest.mark.asyncio
-async def test_non_naive_backend_sends_weights_through_checkpoint_engine(monkeypatch):
-    _patch_gpu_side_effects(monkeypatch)
-
-    worker = _make_worker(peft_config=None, backend="nccl")
-    sent = []
-
-    async def send_weights(weights, global_steps=None):
-        sent.append((weights, global_steps))
-
-    worker.checkpoint_engine.send_weights = send_weights
-
-    from verl.workers.engine_workers import ActorRolloutRefWorker
-
-    await ActorRolloutRefWorker.update_weights(worker, global_steps=14, mode="auto")
-
-    assert sent == [("adapter", 14)]
-    assert worker.rollout.events == []

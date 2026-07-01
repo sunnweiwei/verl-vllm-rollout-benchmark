@@ -110,6 +110,16 @@ def test_non_vllm_rollout_names_remain_selectable_when_installed():
         assert cls is not None
 
 
+def test_vllm_rollout_adapter_is_selectable_but_not_sync_batch_generator():
+    from verl.workers.rollout.base import get_rollout_class
+
+    rollout_cls = get_rollout_class("vllm", "async")
+    rollout = rollout_cls.__new__(rollout_cls)
+
+    with pytest.raises(NotImplementedError):
+        rollout.generate_sequences(None)
+
+
 @pytest.mark.asyncio
 async def test_load_balancer_preserves_sticky_sessions_and_clears_inflight():
     from verl.workers.rollout.llm_server import GlobalRequestLoadBalancer

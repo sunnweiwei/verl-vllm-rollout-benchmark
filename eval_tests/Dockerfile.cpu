@@ -2,4 +2,9 @@ FROM verlai/verl:vllm012.latest
 
 SHELL ["/bin/bash", "-lc"]
 
-RUN python -m pip install --no-cache-dir pytest pytest-asyncio
+RUN python -m pip install --no-cache-dir \
+    pytest \
+    pytest-asyncio \
+    pytest-rerunfailures \
+    "nvidia-modelopt[torch]>=0.37.0" \
+    "checkpoint-engine[p2p]>=0.4.0"
